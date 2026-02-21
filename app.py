@@ -8,46 +8,62 @@ import streamlit as st
 import pandas as pd
 
 # ==========================================
-# 資料庫初始化與日誌功能 (零依賴，使用內建 sqlite3)
+# 系統常數與資料庫初始化
 # ==========================================
 DB_FILE = "logs.db"
 
 def init_db():
-    """初始化 SQLite 資料庫，若不存在則建立資料表"""
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS usage_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            username TEXT,
-            filename TEXT,
-            mode TEXT,
-            process_time REAL
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    """初始化 SQLite 資料庫，加入 timeout 處理多人併發寫入"""
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=10.0, check_same_thread=False)
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS usage_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                username TEXT,
+                filename TEXT,
+                mode TEXT,
+                process_time REAL
+            )
+        ''')
+        conn.commit()
+    except sqlite3.Error as e:
+        st.error(f"資料庫初始化失敗: {e}")
+    finally:
+        if 'conn' in locals():
+            conn.close()
 
 def log_activity(username: str, filename: str, mode: str, process_time: float):
-    """寫入轉檔紀錄至資料庫"""
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    c = conn.cursor()
-    # 轉換為台北時間 (UTC+8) 儲存
-    tw_time = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
-    c.execute('''
-        INSERT INTO usage_logs (timestamp, username, filename, mode, process_time)
-        VALUES (?, ?, ?, ?, ?)
-    ''', (tw_time, username, filename, mode, process_time))
-    conn.commit()
-    conn.close()
+    """寫入轉檔紀錄至資料庫 (具備併發防護)"""
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=10.0, check_same_thread=False)
+        c = conn.cursor()
+        # 轉換為台北時間 (UTC+8) 儲存
+        tw_time = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
+        c.execute('''
+            INSERT INTO usage_logs (timestamp, username, filename, mode, process_time)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (tw_time, username, filename, mode, process_time))
+        conn.commit()
+    except sqlite3.Error as e:
+        st.error(f"寫入日誌失敗: {e}")
+    finally:
+        if 'conn' in locals():
+            conn.close()
 
 def fetch_logs() -> pd.DataFrame:
     """讀取所有日誌並回傳為 DataFrame"""
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    df = pd.read_sql_query("SELECT * FROM usage_logs ORDER BY id DESC", conn)
-    conn.close()
-    return df
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=10.0, check_same_thread=False)
+        df = pd.read_sql_query("SELECT * FROM usage_logs ORDER BY id DESC", conn)
+        return df
+    except sqlite3.Error as e:
+        st.error(f"讀取日誌失敗: {e}")
+        return pd.DataFrame()
+    finally:
+        if 'conn' in locals():
+            conn.close()
 
 # 確保啟動時資料庫已準備就緒
 init_db()
@@ -78,16 +94,21 @@ def format_hms(sec: float) -> str:
     return str(datetime.timedelta(seconds=int(sec)))
 
 def run_task_streamlit(cmd: list, total_sec: float, label: str, progress_bar, status_text) -> float:
-    """執行 FFmpeg 並即時更新 Streamlit 進度條"""
+    """執行 FFmpeg 並即時更新 Streamlit 進度條 (具備異常捕捉)"""
     cmd_full = cmd + ['-progress', 'pipe:1', '-nostats', '-loglevel', 'quiet']
-    process = subprocess.Popen(
-        cmd_full, 
-        stdout=subprocess.PIPE, 
-        stderr=subprocess.STDOUT, 
-        universal_newlines=True, 
-        encoding='utf-8', 
-        errors='ignore'
-    )
+    
+    try:
+        process = subprocess.Popen(
+            cmd_full, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.STDOUT, 
+            universal_newlines=True, 
+            encoding='utf-8', 
+            errors='ignore'
+        )
+    except FileNotFoundError:
+        st.error("系統找不到 FFmpeg，請確認伺服器已安裝 FFmpeg 或 packages.txt 設定正確。")
+        return 0.0
 
     start_t = time.time()
     while True:
@@ -110,12 +131,16 @@ def run_task_streamlit(cmd: list, total_sec: float, label: str, progress_bar, st
     process.wait()
     t_cost = time.time() - start_t
     
-    progress_bar.progress(1.0)
-    status_text.text(f"-> {label} | 100% [完成] 耗時: {format_hms(t_cost)}")
+    if process.returncode != 0:
+        st.error(f"轉檔過程發生異常，FFmpeg 退出碼: {process.returncode}")
+    else:
+        progress_bar.progress(1.0)
+        status_text.text(f"-> {label} | 100% [完成] 耗時: {format_hms(t_cost)}")
+        
     return t_cost
 
 # ==========================================
-# 頁面與全域狀態初始化
+# 頁面與全域狀態初始化 (State-First)
 # ==========================================
 st.set_page_config(page_title="族語影像自動化產線", page_icon="🚀", layout="wide")
 
@@ -131,15 +156,22 @@ if "admin_logged_in" not in st.session_state:
     st.session_state.admin_logged_in = False
 
 # ==========================================
-# 側邊欄：管理者登入
+# 側邊欄：管理者登入 (安全憑證防護)
 # ==========================================
 with st.sidebar:
     st.header("🔒 管理者登入")
+    
+    # 檢查 secrets 是否有設定密碼
+    try:
+        CORRECT_PASSWORD = st.secrets["admin_password"]
+    except KeyError:
+        st.error("系統未設定管理員密碼！請在 `.streamlit/secrets.toml` 中設定 `admin_password`。")
+        CORRECT_PASSWORD = None
+
     if not st.session_state.admin_logged_in:
-        admin_pwd = st.text_input("請輸入管理員密碼", type="password")
-        if st.button("登入"):
-            # 預設密碼設為 admin123，您可自行修改
-            if admin_pwd == "admin123":
+        admin_pwd = st.text_input("請輸入管理員密碼", type="password", disabled=(CORRECT_PASSWORD is None))
+        if st.button("登入", disabled=(CORRECT_PASSWORD is None)):
+            if admin_pwd == CORRECT_PASSWORD:
                 st.session_state.admin_logged_in = True
                 st.success("登入成功！")
                 st.rerun()
@@ -208,8 +240,12 @@ with tab1:
                     status_text = st.empty()
                     
                     input_path = os.path.join(temp_dir, uploaded_file.name)
-                    with open(input_path, "wb") as f:
-                        f.write(uploaded_file.getbuffer())
+                    try:
+                        with open(input_path, "wb") as f:
+                            f.write(uploaded_file.getbuffer())
+                    except Exception as e:
+                        st.error(f"寫入暫存檔失敗: {e}")
+                        continue
                     
                     dur = get_duration(input_path)
                     base_name = os.path.splitext(uploaded_file.name)[0]
@@ -224,15 +260,18 @@ with tab1:
                         run_task_streamlit(cmd, dur, label, progress_bar, status_text)
                         
                         if os.path.exists(output_path):
-                            with open(output_path, "rb") as f:
-                                file_bytes = f.read()
-                            
-                            mime_type = "video/mp4" if ext == ".mp4" else f"audio/{ext.replace('.', '')}"
-                            st.session_state.converted_files.append({
-                                "name": output_filename,
-                                "data": file_bytes,
-                                "mime": mime_type
-                            })
+                            try:
+                                with open(output_path, "rb") as f:
+                                    file_bytes = f.read()
+                                
+                                mime_type = "video/mp4" if ext == ".mp4" else f"audio/{ext.replace('.', '')}"
+                                st.session_state.converted_files.append({
+                                    "name": output_filename,
+                                    "data": file_bytes,
+                                    "mime": mime_type
+                                })
+                            except Exception as e:
+                                st.error(f"讀取輸出檔失敗: {e}")
                     
                     file_cost = time.time() - file_start
                     st.session_state.report_data.append((uploaded_file.name, file_cost))
